@@ -1,0 +1,164 @@
+#!/bin/bash
+#
+# Usage: kubectl-isolate [options] <service_name> <pod_name>
+#
+# options:
+#  --dry-run
+#  --kubeconfig path
+#  --context context
+#  -n namespace
+#  --namespace namespace
+#  --no-prompt
+#
+# https://www.reddit.com/r/kubernetes/comments/gt3uvg/how_to_quarantine_pods/
+# https://twitter.com/danielepolencic/status/1275786970610843648
+#
+usage() {
+  cat 1>&2 <<EOF
+Usage: $0 [options] <service_name> <pod_name
+
+  options:
+   --dry-run
+   --kubeconfig path
+   --context context
+   -n namespace
+   --namespace namespace
+   --no-prompt
+EOF
+  exit 1
+}
+
+kubeconfig=""
+context=""
+namespace=""
+service=""
+pod=""
+dryrun=""
+if=""
+no_prompt=""
+
+tty > /dev/null 2>&1
+if [ $? -eq 0 ] ; then
+  type fzf > /dev/null 2>&1 && if=fzf
+  if [ -z "$if" ] ; then
+    type peco > /dev/null 2>&1 && if="peco --layout=bottom-up"
+  fi
+fi
+
+while [ $# -gt 0 ] ; do
+  key="$1"
+
+  case "$key" in
+    --dry-run)
+      dryrun=true
+      shift
+      ;;
+    --debug)
+      set -x
+      shift
+      ;;
+    --context)
+      context="--context $2"
+      shift
+      shift
+      ;;
+    --kubeconfig)
+      kubeconfig="--kubeconfig $2"
+      shift
+      shift
+      ;;
+    -n|--namespace)
+      namespace="--namespace $2"
+      shift
+      shift
+      ;;
+    --no-prompt)
+      no_prompt=true
+      shift
+      ;;
+    -h|--help)
+      usage 
+      shift
+      ;;
+    *)
+      if [ -z "$service" ] ; then
+        service="$1"
+        shift
+      else
+        pod="$1"
+        shift
+      fi
+  esac
+done
+
+kubectl="kubectl $kubeconfig $context $namespace"
+
+if [ -z "$service" ] ; then
+  if [ -z "$no_prompt" -a -n "$if" ] ; then
+    service=$($kubectl get services -o name | cut -d / -f 2 | $if --prompt="select service > ")
+  fi
+  if [ -z "$service" ] ; then
+    echo "No service name specified" 1>&2
+    echo "" 1>&2
+    echo "Usage: kubectl-isolate <service> <pod>" 1>&2
+    exit 1
+  fi
+fi
+
+if [ -z "$pod" ] ; then
+  if [ -z "$no_prompt" -a -n "$if" ] ; then
+    pod=$($kubectl get endpoints $service -o jsonpath='{range .subsets[].addresses[*]}{.targetRef.name}{"\n"}{end}' | $if --prompt="select pod > ")
+  fi
+  if [ -z "$pod" ] ; then
+    echo "No pod name specified" 1>&2
+    echo "" 1>&2
+    echo "Usage: kubectl-isolate <service> <pod>" 1>&2
+    exit 1
+  fi
+fi
+
+
+#
+# get service selector
+#
+service_labels=$($kubectl get service $service --template='{{range $k, $v := .spec.selector}}{{ $k }}{{"="}}{{ $v }}.isolated{{" "}}{{end}}')
+if [ $? -ne 0 ] ; then
+  exit 2
+fi
+
+
+#
+# check pod existence
+#
+$kubectl get pod $pod > /dev/null
+if [ $? -ne 0 ] ; then
+  exit 3
+fi
+
+
+#
+# relabel
+#
+if [ -n "$dryrun" ] ; then
+  echo "[dry-run] $kubectl label --overwrite pod $pod $service_labels"
+  exit
+fi
+
+if [ -z "$no_prompt" ] ; then
+  echo "Isolating Pod:\"$pod\" from Service:\"$service\". Are you sure? (y/N)"
+  read ans
+  case $ans in
+    y*|Y*)
+      ;;
+    *)
+      echo "Canceled. bye."
+      exit 4
+      ;;
+  esac
+fi
+
+$kubectl label --overwrite pod $pod $service_labels
+if [ $? -ne 0 ] ; then
+  exit 5
+fi
+
